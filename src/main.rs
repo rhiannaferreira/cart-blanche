@@ -681,12 +681,73 @@ fn main() {
     let person_of = |u: Key| -> Key { linkmap.map(u) };
     lap("links + events parsed");
 
-    // ---- dedup per event_id partition, then repartition by person
-    let deduped: Vec<(Bins<Ev>, Vec<Ev>, Vec<RawEv>)> = par(
+    // ---- clicks, and dedup per event_id partition with repartition by person,
+    // as one pool of tasks: click ranges first, then the many small partitions
+    let csrc = open_sources(&list_csv(&data.join("clicks")));
+    let cr = ranges(&csrc, 2 << 20);
+    let csz = (we - cs) as u64;
+    let ck_bytes: usize = csrc.iter().map(|s| s.len - s.data_start).sum();
+    let ck_cap = (ck_bytes / 45 + 1024) * 11 / 10 / (nt * P2) + 64;
+    struct DState {
+        out: Bins<Ev>,
+        surv: Vec<Ev>,
+        tbl: Vec<RawEv>,
+        buf: Vec<u8>,
+        pos: Vec<u32>,
+        dc: DateCache,
+        parts: Bins<Click>,
+    }
+    let ncr = cr.len();
+    let dstates: Vec<DState> = par(
         nt,
-        P1,
-        || (Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64), Vec::<Ev>::new(), Vec::<RawEv>::new()),
-        |(out, surv, tbl), p| {
+        ncr + P1,
+        || DState {
+            out: Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64),
+            surv: Vec::new(),
+            tbl: Vec::new(),
+            buf: Vec::new(),
+            pos: Vec::new(),
+            dc: DateCache::new(),
+            parts: Bins::<Click>::new(P2, ck_cap),
+        },
+        |st, task| {
+            if task < ncr {
+                let i = task;
+                let (buf, pos, dc, parts) = (&mut st.buf, &mut st.pos, &mut st.dc, &mut st.parts);
+                // clicks wait in a small ring so the link-table prefetch can land
+                const RING: usize = 16;
+                let mut ring = [Click { person: 0, cid: 0, ts: 0, camp: 0 }; RING];
+                let mut rn = 0usize;
+                let out = |c: Click, parts: &mut Bins<Click>| {
+                    let person = person_of(c.person);
+                    parts.push(part2(person), Click { person, ..c });
+                };
+                with_rows::<4>(&csrc, &cr[i], buf, pos, |f| {
+                    if f[0].is_empty() || f[1].is_empty() {
+                        return;
+                    }
+                    let Some(ts) = parse_ts(f[3], dc) else { return };
+                    let rel = ts.wrapping_sub(cs) as u64;
+                    if rel >= csz {
+                        return;
+                    }
+                    let Some(camp) = campaigns.get(f[2]) else { return };
+                    let uk = key(f[1]);
+                    linkmap.prefetch(uk);
+                    let slot = rn % RING;
+                    if rn >= RING {
+                        out(ring[slot], parts);
+                    }
+                    ring[slot] = Click { person: uk, cid: key(f[0]), ts: rel as u32, camp };
+                    rn += 1;
+                });
+                for j in rn.saturating_sub(RING)..rn {
+                    out(ring[j % RING], parts);
+                }
+                return;
+            }
+            let p = task - ncr;
+            let (out, surv, tbl) = (&mut st.out, &mut st.surv, &mut st.tbl);
             let total: usize = parsed.iter().map(|s| s.parts.len(p)).sum();
             surv.clear();
             surv.reserve(total);
@@ -739,60 +800,15 @@ fn main() {
             table::fence();
         },
     );
-    let deduped: Vec<Bins<Ev>> = deduped
-        .into_iter()
-        .map(|mut x| {
-            x.0.finish();
-            x.0
-        })
-        .collect();
+    let mut deduped: Vec<Bins<Ev>> = Vec::with_capacity(nt);
+    let mut clicks: Vec<Bins<Click>> = Vec::with_capacity(nt);
+    for mut st in dstates {
+        st.out.finish();
+        deduped.push(st.out);
+        clicks.push(st.parts);
+    }
     std::mem::forget(parsed);
-    lap("events deduped");
-
-    // ---- clicks
-    let csrc = open_sources(&list_csv(&data.join("clicks")));
-    let cr = ranges(&csrc, 2 << 20);
-    let csz = (we - cs) as u64;
-    let ck_bytes: usize = csrc.iter().map(|s| s.len - s.data_start).sum();
-    let ck_cap = (ck_bytes / 45 + 1024) * 11 / 10 / (nt * P2) + 64;
-    let clicks: Vec<(Vec<u8>, Vec<u32>, DateCache, Bins<Click>)> = par(
-        nt,
-        cr.len(),
-        || (Vec::new(), Vec::new(), DateCache::new(), Bins::<Click>::new(P2, ck_cap)),
-        |(buf, pos, dc, parts), i| {
-            // clicks wait in a small ring so the link-table prefetch can land
-            const RING: usize = 16;
-            let mut ring = [Click { person: 0, cid: 0, ts: 0, camp: 0 }; RING];
-            let mut rn = 0usize;
-            let out = |c: Click, parts: &mut Bins<Click>| {
-                let person = person_of(c.person);
-                parts.push(part2(person), Click { person, ..c });
-            };
-            with_rows::<4>(&csrc, &cr[i], buf, pos, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let Some(ts) = parse_ts(f[3], dc) else { return };
-                let rel = ts.wrapping_sub(cs) as u64;
-                if rel >= csz {
-                    return;
-                }
-                let Some(camp) = campaigns.get(f[2]) else { return };
-                let uk = key(f[1]);
-                linkmap.prefetch(uk);
-                let slot = rn % RING;
-                if rn >= RING {
-                    out(ring[slot], parts);
-                }
-                ring[slot] = Click { person: uk, cid: key(f[0]), ts: rel as u32, camp };
-                rn += 1;
-            });
-            for j in rn.saturating_sub(RING)..rn {
-                out(ring[j % RING], parts);
-            }
-        },
-    );
-    lap("clicks parsed");
+    lap("clicks parsed, events deduped");
 
     // ---- sessionize + attribute per person partition
     let day0 = ws.div_euclid(DAY_MS);
@@ -843,7 +859,7 @@ fn main() {
             let cks = &mut st.cks;
             cks.clear();
             for d in &clicks {
-                let (x, y) = d.3.bin(b);
+                let (x, y) = d.bin(b);
                 cks.extend_from_slice(x);
                 cks.extend_from_slice(y);
             }
