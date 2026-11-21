@@ -430,7 +430,7 @@ fn main() {
     let we = get("\"window_end\"");
     let cs = ws - 7 * DAY_MS;
     assert!(we - cs < u32::MAX as i64, "window too long");
-    let ibase = ws.div_euclid(1000) - 30 * 86400; // ingest seconds base
+    let ibase = ws - 15 * DAY_MS; // ingest ms base; rows that matter are ingested within [ws, we + 5 days]
 
     // ---- products -> categories, ids in byte-wise order of name ("unknown" competes)
     let mut prod_raw: Vec<(Vec<u8>, Vec<u8>)> = vec![];
@@ -621,7 +621,7 @@ fn main() {
                 let eid = key(f[0]);
                 let ing_ms = parse_ts(f[3], dc);
                 let ingest = match ing_ms {
-                    Some(m) => (m.div_euclid(1000) - ibase).clamp(0, u32::MAX as i64 - 1) as u32,
+                    Some(m) => (m.wrapping_sub(ibase) as u64).min(u32::MAX as u64 - 1) as u32,
                     None => u32::MAX,
                 };
                 let mut r = RawEv { eid, person: 0, ts: 0, ingest, price: 0, cat: 0, kind: 255 };
@@ -837,7 +837,7 @@ fn main() {
             }
             // group by person with a counting sort, then order each person's rows by time
             let lm = &mut st.lm;
-            lm.reset(evs.len() + 16);
+            lm.reset(evs.len() / 8 + 64);
             let elid = &mut st.elid;
             elid.clear();
             let mut nl = 0u64;

@@ -2,6 +2,7 @@
 pub struct Map64 {
     slots: Vec<[u64; 2]>,
     mask: usize,
+    len: usize,
 }
 
 const EMPTY: u64 = u64::MAX;
@@ -15,7 +16,7 @@ fn h(k: u64) -> u64 {
 impl Map64 {
     pub fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        Map64 { slots: vec![[EMPTY, 0]; cap], mask: cap - 1 }
+        Map64 { slots: vec![[EMPTY, 0]; cap], mask: cap - 1, len: 0 }
     }
     /// Empties the map and sizes it for n keys at a load of at most ~0.65,
     /// reusing the allocation.
@@ -27,6 +28,22 @@ impl Map64 {
             self.slots[..cap].fill([EMPTY, 0]);
         }
         self.mask = cap - 1;
+        self.len = 0;
+    }
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let live = self.mask + 1;
+        let old = std::mem::take(&mut self.slots);
+        let cap = live * 2;
+        self.slots = vec![[EMPTY, 0]; cap];
+        self.mask = cap - 1;
+        for s in &old[..live] {
+            if s[0] != EMPTY {
+                let i = self.slot(s[0]);
+                self.slots[i] = *s;
+            }
+        }
     }
     /// The slot holding k, or the empty slot where k would go.
     #[inline(always)]
@@ -63,6 +80,10 @@ impl Map64 {
         match self.val_at(i) {
             None => {
                 self.set_at(i, k, v);
+                self.len += 1;
+                if self.len * 10 > (self.mask + 1) * 7 {
+                    self.grow();
+                }
                 (v, true)
             }
             Some(old) => (old, false),
