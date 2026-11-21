@@ -42,23 +42,39 @@ where
     F: Fn(&mut S, usize) + Sync,
 {
     let next = AtomicUsize::new(0);
+    let stat = std::env::var_os("PARSTAT").is_some();
+    let t0 = std::time::Instant::now();
     std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 sc.spawn(|| {
                     let mut s = init();
+                    let mut worst = (0f64, 0usize);
                     loop {
                         let i = next.fetch_add(1, AO::Relaxed);
                         if i >= n {
                             break;
                         }
+                        let t = std::time::Instant::now();
                         f(&mut s, i);
+                        if stat {
+                            let d = t.elapsed().as_secs_f64();
+                            if d > worst.0 {
+                                worst = (d, i);
+                            }
+                        }
                     }
-                    s
+                    (s, t0.elapsed().as_secs_f64(), worst)
                 })
             })
             .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
+        let r: Vec<_> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        if stat {
+            let ends: Vec<String> = r.iter().map(|x| format!("{:.3}", x.1)).collect();
+            let w = r.iter().map(|x| x.2).fold((0f64, 0), |a, b| if b.0 > a.0 { b } else { a });
+            eprintln!("par n={n}: thread ends {} | worst task {} {:.3}s", ends.join(" "), w.1, w.0);
+        }
+        r.into_iter().map(|x| x.0).collect()
     })
 }
 
@@ -779,25 +795,31 @@ fn main() {
                     }
                 }
             }
+            // winners -> person partitions, waiting in a ring so the link-table
+            // prefetch can land
+            const RING: usize = 32;
+            let mut ring = [Ev { person: 0, ts: 0, pc: 0 }; RING];
+            let mut rn = 0usize;
             for r in tbl.iter() {
                 if r.kind != 255 && r.eid != u64::MAX {
                     let pc = if r.kind == 2 { (r.price << 8) | r.cat as u32 } else { 0 };
-                    surv.push(Ev { person: r.person, ts: r.ts, pc });
+                    linkmap.prefetch(r.person);
+                    let slot = rn % RING;
+                    if rn >= RING {
+                        let mut e = ring[slot];
+                        e.person = person_of(e.person);
+                        out.push(part2(e.person), e);
+                    }
+                    ring[slot] = Ev { person: r.person, ts: r.ts, pc };
+                    rn += 1;
                 }
             }
-            // user -> person, with the link-table loads prefetched ahead
-            const AHEAD: usize = 48;
-            for j in 0..surv.len().min(AHEAD) {
-                linkmap.prefetch(surv[j].person);
-            }
-            for j in 0..surv.len() {
-                if j + AHEAD < surv.len() {
-                    linkmap.prefetch(surv[j + AHEAD].person);
-                }
-                let mut e = surv[j];
+            for j in rn.saturating_sub(RING)..rn {
+                let mut e = ring[j % RING];
                 e.person = person_of(e.person);
                 out.push(part2(e.person), e);
             }
+            let _ = &surv;
             table::fence();
         },
     );
