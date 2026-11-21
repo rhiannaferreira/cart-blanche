@@ -558,6 +558,7 @@ fn main() {
         }
     }
     let nmap = (0..n).filter(|&i| name[parent[i] as usize] != ids[i]).count();
+    if std::env::var_os("TIMING").is_some() { eprintln!("ids {n} nmap {nmap}"); }
     let mut linkmap = LinkMap::new(nmap + 16);
     for i in 0..n {
         if i + 16 < n {

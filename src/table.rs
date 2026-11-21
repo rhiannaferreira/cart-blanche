@@ -164,7 +164,7 @@ pub struct LinkMap {
 
 impl LinkMap {
     pub fn new(n: usize) -> Self {
-        let cap = ((n * 3 / 2).max(16)).next_power_of_two();
+        let cap = ((n + n / 4).max(16)).next_power_of_two();
         let slots = alloc_huge::<[u64; 2]>(cap); // zeroed: key 0 never occurs, so 0 marks empty
         let fbits = (n * 16).next_power_of_two().clamp(1 << 16, 1 << 26);
         LinkMap { slots, mask: cap - 1, filter: vec![0; fbits / 64], fmask: fbits - 1 }
