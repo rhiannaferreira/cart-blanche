@@ -449,12 +449,27 @@ fn main() {
     let ibase = ws - 15 * DAY_MS; // ingest ms base; rows that matter are ingested within [ws, we + 5 days]
 
     // ---- products -> categories, ids in byte-wise order of name ("unknown" competes)
-    let mut prod_raw: Vec<(Vec<u8>, Vec<u8>)> = vec![];
-    small_rows::<2>(&data.join("products.csv"), |f| prod_raw.push((f[0].to_vec(), f[1].to_vec())));
-    let mut cats: Vec<Vec<u8>> = prod_raw.iter().map(|x| x.1.clone()).collect();
-    cats.push(b"unknown".to_vec());
+    let prod_file = read_small(&data.join("products.csv"));
+    let mut prod_raw: Vec<(&[u8], &[u8])> = Vec::with_capacity(prod_file.len() / 16);
+    if let Some(nl) = prod_file.iter().position(|&c| c == b'\n') {
+        let d = &prod_file[nl + 1..];
+        let mut p = 0;
+        while p < d.len() {
+            let e = memchr_nl(d, p);
+            let mut fs: [&[u8]; 2] = [&[]; 2];
+            if split(&d[p..e], &mut fs) {
+                prod_raw.push((fs[0], fs[1]));
+            }
+            p = e + 1;
+        }
+    }
+    let mut cats: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
+    for (_, c) in &prod_raw {
+        if !cats.iter().any(|x| x.as_slice() == *c) {
+            cats.push(c.to_vec());
+        }
+    }
     cats.sort();
-    cats.dedup();
     let cat_id = |c: &[u8]| cats.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u16;
     let mut products = Products { dense: vec![], other: Default::default(), unknown: cat_id(b"unknown") };
     for (p, c) in &prod_raw {
@@ -469,7 +484,7 @@ fn main() {
                 }
             }
             _ => {
-                products.other.entry(p.clone()).or_insert(id);
+                products.other.entry(p.to_vec()).or_insert(id);
             }
         }
     }
