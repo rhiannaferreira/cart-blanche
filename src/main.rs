@@ -844,7 +844,7 @@ fn main() {
     let wsday = ws - day0 * DAY_MS; // ms from day0 midnight to window_start
 
     struct SState {
-        camp: Vec<[i64; 4]>,
+        camp: Vec<[i64; 2]>, // sessions | purchasing << 32, revenue
         asst: Vec<u32>,
         users: Vec<Vec<UserRow>>,
         evs: Vec<Ev>,
@@ -867,7 +867,7 @@ fn main() {
     let sres: Vec<SState> = par(
         nt,
         P2,
-        || SState { camp: vec![[0i64; 4]; ncamp * ndays], asst: vec![0u32; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new(), lm: Map64::new(16) },
+        || SState { camp: vec![[0i64; 2]; ncamp * ndays], asst: vec![0u32; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new(), lm: Map64::new(16) },
         |st, oi| {
             let b = order[oi];
             let mut parts: Vec<&[Ev]> = Vec::with_capacity(2 * deduped.len());
@@ -1068,9 +1068,8 @@ fn main() {
                         }
                     }
                     let a = &mut camp_acc[camp as usize * ndays + dayi as usize];
-                    a[0] += 1;
-                    a[1] += purch as i64;
-                    a[2] += rev;
+                    a[0] += 1 | ((purch as i64) << 32);
+                    a[1] += rev;
                     s_start.push(sc);
                     s_day.push(dayi);
                     i = j;
@@ -1127,9 +1126,9 @@ fn main() {
             x[3] += *y as i64;
         }
         for (x, y) in camp_acc.iter_mut().zip(s.camp.iter()) {
-            for t in 0..4 {
-                x[t] += y[t];
-            }
+            x[0] += y[0] & 0xFFFF_FFFF;
+            x[1] += y[0] >> 32;
+            x[2] += y[1];
         }
         users.extend(s.users);
     }
