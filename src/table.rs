@@ -124,12 +124,11 @@ impl LinkMap {
     }
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
-        let b = self.fbit(k);
-        if unsafe { *self.filter.get_unchecked(b >> 6) } & (1 << (b & 63)) == 0 {
-            return;
-        }
         #[cfg(target_arch = "x86_64")]
         unsafe {
+            let b = self.fbit(k);
+            let f = self.filter.as_ptr().add(b >> 6) as *const i8;
+            std::arch::x86_64::_mm_prefetch(f, std::arch::x86_64::_MM_HINT_T0);
             let p = self.slots.as_ptr().add(self.home(k)) as *const i8;
             std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
         }
@@ -210,5 +209,75 @@ pub fn map_file(f: &std::fs::File, len: usize) -> *const u8 {
         }
         madvise(p, len, 2); // MADV_SEQUENTIAL
         p
+    }
+}
+
+/// Partitions shared by all threads: each thread claims blocks of slots with
+/// one atomic add per block, so memory stays close to the real row count.
+/// A thread's unfinished block is padded with a sentinel the reader skips.
+pub struct Shared<T: Copy + 'static> {
+    base: *mut T,
+    cap: usize,
+    cursors: Vec<std::sync::atomic::AtomicUsize>,
+}
+unsafe impl<T: Copy + Send + 'static> Send for Shared<T> {}
+unsafe impl<T: Copy + Sync + 'static> Sync for Shared<T> {}
+
+pub const BLOCK: usize = 64;
+
+pub struct Writer<T: Copy + 'static> {
+    pos: Vec<(u32, u32)>, // (next, end) in the current block of each bin
+    pub spill: Vec<Vec<T>>,
+}
+
+impl<T: Copy + 'static> Shared<T> {
+    pub fn new(nbins: usize, cap: usize) -> Self {
+        let cap = (cap + BLOCK).next_multiple_of(BLOCK);
+        let mem = alloc_huge::<T>(nbins * cap);
+        Shared {
+            base: mem.as_mut_ptr(),
+            cap,
+            cursors: (0..nbins).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect(),
+        }
+    }
+    pub fn writer(&self) -> Writer<T> {
+        let n = self.cursors.len();
+        Writer { pos: vec![(0, 0); n], spill: (0..n).map(|_| Vec::new()).collect() }
+    }
+    #[inline(always)]
+    pub fn push(&self, w: &mut Writer<T>, b: usize, x: T) {
+        let p = unsafe { w.pos.get_unchecked_mut(b) };
+        if p.0 < p.1 {
+            unsafe { self.base.add(b * self.cap + p.0 as usize).write(x) };
+            p.0 += 1;
+        } else {
+            self.claim(w, b, x);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn claim(&self, w: &mut Writer<T>, b: usize, x: T) {
+        let s = self.cursors[b].fetch_add(BLOCK, std::sync::atomic::Ordering::Relaxed);
+        if s < self.cap {
+            unsafe { self.base.add(b * self.cap + s).write(x) };
+            w.pos[b] = (s as u32 + 1, (s + BLOCK).min(self.cap) as u32);
+        } else {
+            w.pos[b] = (0, 0);
+            w.spill[b].push(x);
+        }
+    }
+    /// Pads the writer's open blocks with the sentinel.
+    pub fn finish(&self, w: &mut Writer<T>, sentinel: T) {
+        for (b, p) in w.pos.iter_mut().enumerate() {
+            for i in p.0..p.1 {
+                unsafe { self.base.add(b * self.cap + i as usize).write(sentinel) };
+            }
+            *p = (0, 0);
+        }
+    }
+    /// The bin's claimed slots (may contain sentinels).
+    pub fn bin(&self, b: usize) -> &[T] {
+        let n = self.cursors[b].load(std::sync::atomic::Ordering::Relaxed).min(self.cap);
+        unsafe { std::slice::from_raw_parts(self.base.add(b * self.cap), n) }
     }
 }

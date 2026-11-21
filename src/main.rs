@@ -602,7 +602,7 @@ fn main() {
     let nolook = std::env::var_os("NOLOOK").is_some();
     let ev_bytes: usize = esrc.iter().map(|s| s.len - s.data_start).sum();
     let ev_est = ev_bytes / 70 + 1024; // rows, about 75 bytes each
-    let ev_cap = ev_est * 3 / 2 / (nt * P1) + 64;
+    let ev_cap = ev_est * 11 / 10 / (nt * P1) + 64;
     let parsed: Vec<EvState> = par(
         nt,
         er.len(),
@@ -686,7 +686,7 @@ fn main() {
     let deduped: Vec<Bins<Ev>> = par(
         nt,
         P1,
-        || Bins::<Ev>::new(P2, ev_est * 3 / 2 / (nt * P2) + 64),
+        || Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64),
         |out, p| {
             let total: usize = parsed.iter().map(|s| s.parts.len(p)).sum();
             let mut surv: Vec<Ev> = Vec::with_capacity(total);
@@ -739,7 +739,7 @@ fn main() {
     let cr = ranges(&csrc, 2 << 20);
     let csz = (we - cs) as u64;
     let ck_bytes: usize = csrc.iter().map(|s| s.len - s.data_start).sum();
-    let ck_cap = (ck_bytes / 45 + 1024) * 3 / 2 / (nt * P2) + 64;
+    let ck_cap = (ck_bytes / 45 + 1024) * 11 / 10 / (nt * P2) + 64;
     let clicks: Vec<(Vec<u8>, Vec<u32>, DateCache, Bins<Click>)> = par(
         nt,
         cr.len(),
