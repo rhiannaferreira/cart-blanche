@@ -45,6 +45,14 @@ impl Map64 {
             }
         }
     }
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let p = self.slots.as_ptr().add(h(k) as usize & self.mask) as *const i8;
+            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
     /// The slot holding k, or the empty slot where k would go.
     #[inline(always)]
     pub fn slot(&self, k: u64) -> usize {
@@ -127,10 +135,7 @@ pub struct LinkMap {
 impl LinkMap {
     pub fn new(n: usize) -> Self {
         let cap = ((n * 3 / 2).max(16)).next_power_of_two();
-        let slots = alloc_huge::<[u64; 2]>(cap);
-        for s in slots.iter_mut() {
-            s[0] = EMPTY;
-        }
+        let slots = alloc_huge::<[u64; 2]>(cap); // zeroed: key 0 never occurs, so 0 marks empty
         let fbits = (n * 16).next_power_of_two().clamp(1 << 16, 1 << 26);
         LinkMap { slots, mask: cap - 1, filter: vec![0; fbits / 64], fmask: fbits - 1 }
     }
@@ -142,12 +147,20 @@ impl LinkMap {
     fn fbit(&self, k: u64) -> usize {
         (k.wrapping_mul(0xC2B2AE3D27D4EB4F) >> 20) as usize & self.fmask
     }
+    #[inline(always)]
+    pub fn prefetch_slot(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let p = self.slots.as_ptr().add(self.home(k)) as *const i8;
+            std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
     pub fn insert(&mut self, k: u64, v: u64) {
         let b = self.fbit(k);
         self.filter[b >> 6] |= 1 << (b & 63);
         let mut i = self.home(k);
         loop {
-            if self.slots[i][0] == EMPTY || self.slots[i][0] == k {
+            if self.slots[i][0] == 0 || self.slots[i][0] == k {
                 self.slots[i] = [k, v];
                 return;
             }
@@ -178,7 +191,7 @@ impl LinkMap {
             if s[0] == k {
                 return s[1];
             }
-            if s[0] == EMPTY {
+            if s[0] == 0 {
                 return k;
             }
             i = (i + 1) & self.mask;

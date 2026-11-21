@@ -510,7 +510,7 @@ fn main() {
         },
     );
     let total_pairs: usize = pairs.iter().map(|p| p.2.len()).sum();
-    let mut idx = Map64::new(total_pairs * 2 + 16);
+    let mut idx = Map64::new(total_pairs + 16);
     let mut ids: Vec<Key> = Vec::with_capacity(total_pairs * 2);
     let mut parent: Vec<u32> = Vec::with_capacity(total_pairs * 2);
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -521,7 +521,7 @@ fn main() {
         }
         x
     }
-    let mut intern = |k: Key, ids: &mut Vec<Key>, parent: &mut Vec<u32>| -> u32 {
+    let intern = |idx: &mut Map64, k: Key, ids: &mut Vec<Key>, parent: &mut Vec<u32>| -> u32 {
         let n = ids.len() as u64;
         let (v, new) = idx.get_or_insert(k, n);
         if new {
@@ -531,9 +531,13 @@ fn main() {
         v as u32
     };
     for (_, _, v) in &pairs {
-        for &(a, b) in v {
-            let ia = intern(a, &mut ids, &mut parent);
-            let ib = intern(b, &mut ids, &mut parent);
+        for (j, &(a, b)) in v.iter().enumerate() {
+            if let Some(&(pa, pb)) = v.get(j + 16) {
+                idx.prefetch(pa);
+                idx.prefetch(pb);
+            }
+            let ia = intern(&mut idx, a, &mut ids, &mut parent);
+            let ib = intern(&mut idx, b, &mut ids, &mut parent);
             let ra = find(&mut parent, ia);
             let rb = find(&mut parent, ib);
             if ra != rb {
@@ -547,15 +551,19 @@ fn main() {
     let mut has: Vec<bool> = vec![false; n];
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
+        parent[i] = r as u32;
         if !has[r] || cmp_keys(ids[i], name[r]) == Ordering::Less {
             name[r] = ids[i];
             has[r] = true;
         }
     }
-    let nmap = (0..n).filter(|&i| name[find(&mut parent, i as u32) as usize] != ids[i]).count();
+    let nmap = (0..n).filter(|&i| name[parent[i] as usize] != ids[i]).count();
     let mut linkmap = LinkMap::new(nmap + 16);
     for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
+        if i + 16 < n {
+            linkmap.prefetch_slot(ids[i + 16]);
+        }
+        let r = parent[i] as usize;
         if name[r] != ids[i] {
             linkmap.insert(ids[i], name[r]);
         }
