@@ -821,12 +821,16 @@ fn main() {
         || SState { camp: vec![[0i64; 4]; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new(), lm: Map64::new(16) },
         |st, oi| {
             let b = order[oi];
-            let evs = &mut st.evs;
-            evs.clear();
+            let mut parts: Vec<&[Ev]> = Vec::with_capacity(2 * deduped.len());
+            let mut nev = 0;
             for d in &deduped {
                 let (x, y) = d.bin(b);
-                evs.extend_from_slice(x);
-                evs.extend_from_slice(y);
+                for z in [x, y] {
+                    if !z.is_empty() {
+                        parts.push(z);
+                        nev += z.len();
+                    }
+                }
             }
             let cks = &mut st.cks;
             cks.clear();
@@ -837,11 +841,11 @@ fn main() {
             }
             // group by person with a counting sort, then order each person's rows by time
             let lm = &mut st.lm;
-            lm.reset(evs.len() / 8 + 64);
+            lm.reset(nev / 8 + 64);
             let elid = &mut st.elid;
             elid.clear();
             let mut nl = 0u64;
-            for e in evs.iter() {
+            for e in parts.iter().flat_map(|z| z.iter()) {
                 let (l, _) = lm.get_or_insert(e.person, nl);
                 nl += (l == nl) as u64;
                 elid.push(l as u32);
@@ -858,11 +862,11 @@ fn main() {
             }
             let ev2 = &mut st.ev2;
             ev2.clear();
-            ev2.reserve(evs.len());
-            unsafe { ev2.set_len(evs.len()) };
+            ev2.reserve(nev);
+            unsafe { ev2.set_len(nev) };
             {
                 let mut cur: Vec<u32> = eoff[..nl].to_vec();
-                for (e, &l) in evs.iter().zip(elid.iter()) {
+                for (e, &l) in parts.iter().flat_map(|z| z.iter()).zip(elid.iter()) {
                     let c = &mut cur[l as usize];
                     ev2[*c as usize] = *e;
                     *c += 1;
