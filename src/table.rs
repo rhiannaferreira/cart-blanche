@@ -108,6 +108,35 @@ const PROT_RW: i32 = 0x1 | 0x2;
 const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
 const MADV_HUGEPAGE: i32 = 14;
 
+static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Drops the pages of every big mapping, from nt threads at once, so that
+/// process exit has little left to tear down. Nothing may be read afterwards.
+pub fn release_all(nt: usize) {
+    const MADV_DONTNEED: i32 = 4;
+    let mut parts = vec![];
+    for &(a, len) in REGIONS.lock().unwrap().iter() {
+        let mut o = 0;
+        while o < len {
+            let l = (len - o).min(64 << 20);
+            parts.push((a + o, l));
+            o += l;
+        }
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..nt {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= parts.len() {
+                    break;
+                }
+                unsafe { madvise(parts[i].0 as *mut u8, parts[i].1, MADV_DONTNEED) };
+            });
+        }
+    });
+}
+
 /// A zeroed, never-freed allocation backed by transparent huge pages when the
 /// kernel allows it. Fewer TLB misses for big random-access tables.
 pub fn alloc_huge<T: Copy + 'static>(n: usize) -> &'static mut [T] {
@@ -119,6 +148,7 @@ pub fn alloc_huge<T: Copy + 'static>(n: usize) -> &'static mut [T] {
         // align to 2 MiB so the kernel can use huge pages
         let a = ((p as usize + (2 << 20) - 1) & !((2 << 20) - 1)) as *mut u8;
         madvise(a, len, MADV_HUGEPAGE);
+        REGIONS.lock().unwrap().push((a as usize, len));
         std::slice::from_raw_parts_mut(a as *mut T, n)
     }
 }
@@ -308,6 +338,7 @@ pub fn map_file(f: &std::fs::File, len: usize) -> *const u8 {
             return std::ptr::null();
         }
         madvise(p, len, 2); // MADV_SEQUENTIAL
+        REGIONS.lock().unwrap().push((p as usize, len));
         p
     }
 }

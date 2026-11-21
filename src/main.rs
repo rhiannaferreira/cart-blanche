@@ -1067,5 +1067,8 @@ fn main() {
             }
         }
     }
-    std::process::exit(0); // skip freeing memory
+    if std::env::var_os("NORELEASE").is_none() {
+        table::release_all(nt);
+    }
+    std::process::exit(0); // skip freeing the rest
 }
