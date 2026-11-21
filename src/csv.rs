@@ -231,6 +231,31 @@ fn masks128(p: *const u8) -> (u128, u128, u128) {
     }
 }
 
+/// Inclusive prefix XOR of the bits of x: bit i of the result is the XOR of
+/// bits 0..=i.
+#[inline(always)]
+fn prefix_xor(x: u128) -> u128 {
+    #[inline(always)]
+    fn p64(x: u64) -> u64 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_set_epi64x(0, x as i64), _mm_set1_epi8(-1), 0)) as u64
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+        {
+            let mut x = x;
+            for s in [1, 2, 4, 8, 16, 32] {
+                x ^= x << s;
+            }
+            x
+        }
+    }
+    let lo = p64(x as u64);
+    let hi = p64((x >> 64) as u64) ^ (0u64.wrapping_sub(lo >> 63));
+    (lo as u128) | ((hi as u128) << 64)
+}
+
 /// Like `rows`, but cuts each line with two 64-byte compares and no
 /// data-dependent branches. Lines over 127 bytes, and a last line without a
 /// newline, go through the scalar splitter. Needs 128 readable bytes past d.len().
@@ -261,29 +286,32 @@ pub fn rows_fast<const N: usize>(d: &[u8], start: usize, stop: usize, mut f: imp
         }
         let l = n.trailing_zeros() as usize;
         let lm = (1u128 << l) - 1;
-        let mut c = c & lm;
+        let c = c & lm;
         let q = q & lm;
         let next = ls + l + 1;
         if c.count_ones() as usize != N - 1 {
             ls = next;
             continue;
         }
-        // a quote may only open a field (after a separator) or close one (before a separator)
+        // a quote may only open a field (after a separator) or close one (before
+        // a separator), and every field opened must be closed, and vice versa
         let seps = c | (1u128 << l);
         let starts = (c << 1) | 1;
         let ends1 = seps >> 1;
-        let mut ok = q & !(starts | ends1) == 0;
-        let mut s = 0usize;
+        let qs = q & starts;
+        let qe = q & ends1;
+        let z = prefix_xor(qs | (qe << 1));
+        let ok = (q & !(starts | ends1)) | (qs & qe) | (z & seps) == 0;
+        let mut a_m = (starts & !qs) | (qs << 1);
+        let mut b_m = (seps & !(qe << 1)) | qe;
         for i in 0..N {
-            let e = if i + 1 < N { c.trailing_zeros() as usize } else { l };
-            c &= c.wrapping_sub(1);
-            let qa = (e > s && unsafe { *base.add(ls + s) } == b'"') as usize;
-            let qb = (e >= s + 2 && unsafe { *base.add(ls + e - 1) } == b'"') as usize;
-            ok &= qa == qb;
-            let (a, b) = (s + qa, (e - qb).max(s + qa));
-            fields[i] = unsafe { std::slice::from_raw_parts(base.add(ls + a), b - a) };
-            s = e + 1;
+            let a = a_m.trailing_zeros() as usize;
+            let b = b_m.trailing_zeros() as usize;
+            a_m &= a_m.wrapping_sub(1);
+            b_m &= b_m.wrapping_sub(1);
+            fields[i] = unsafe { std::slice::from_raw_parts(base.add(ls + a), b.max(a) - a) };
         }
+        let _ = c;
         if ok {
             f(&fields);
         }
