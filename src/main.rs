@@ -669,38 +669,45 @@ fn main() {
     lap("links + events parsed");
 
     // ---- dedup per event_id partition, then repartition by person
-    let deduped: Vec<(Bins<Ev>, Vec<Ev>, Map64)> = par(
+    let deduped: Vec<(Bins<Ev>, Vec<Ev>, Vec<RawEv>)> = par(
         nt,
         P1,
-        || (Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64), Vec::<Ev>::new(), Map64::new(16)),
-        |(out, surv, t), p| {
+        || (Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64), Vec::<Ev>::new(), Vec::<RawEv>::new()),
+        |(out, surv, tbl), p| {
             let total: usize = parsed.iter().map(|s| s.parts.len(p)).sum();
             surv.clear();
             surv.reserve(total);
-            t.reset(total);
-            // value = ingest << 32 | row number; keep the copy with the smallest ingest
-            let mut idx = 0u64;
+            // open addressing on event_id, each slot holding the copy with the
+            // smallest ingest so far (the first one read on a tie)
+            let cap = (total + total / 2 + 16).next_power_of_two();
+            let mask = cap - 1;
+            const NONE: RawEv = RawEv { eid: u64::MAX, person: 0, ts: 0, ingest: 0, price: 0, cat: 0, kind: 255 };
+            tbl.clear();
+            tbl.resize(cap, NONE);
             for s in parsed.iter() {
                 let (x, y) = s.parts.bin(p);
                 for r in x.iter().chain(y.iter()) {
-                    let v = ((r.ingest as u64) << 32) | idx;
-                    let slot = t.slot(r.eid);
-                    match t.val_at(slot) {
-                        Some(old) if old >> 32 <= r.ingest as u64 => {}
-                        _ => t.set_at(slot, r.eid, v),
+                    let mut i = (mix(r.eid) as usize) & mask;
+                    loop {
+                        let t = unsafe { tbl.get_unchecked_mut(i) };
+                        if t.eid == u64::MAX {
+                            *t = *r;
+                            break;
+                        }
+                        if t.eid == r.eid {
+                            if r.ingest < t.ingest {
+                                *t = *r;
+                            }
+                            break;
+                        }
+                        i = (i + 1) & mask;
                     }
-                    idx += 1;
                 }
             }
-            let mut idx = 0u64;
-            for s in parsed.iter() {
-                let (x, y) = s.parts.bin(p);
-                for r in x.iter().chain(y.iter()) {
-                    if r.kind != 255 && t.get(r.eid).unwrap() & 0xFFFF_FFFF == idx {
-                        let pc = if r.kind == 2 { (r.price << 8) | r.cat as u32 } else { 0 };
-                        surv.push(Ev { person: r.person, ts: r.ts, pc });
-                    }
-                    idx += 1;
+            for r in tbl.iter() {
+                if r.kind != 255 && r.eid != u64::MAX {
+                    let pc = if r.kind == 2 { (r.price << 8) | r.cat as u32 } else { 0 };
+                    surv.push(Ev { person: r.person, ts: r.ts, pc });
                 }
             }
             // user -> person, with the link-table loads prefetched ahead
@@ -733,21 +740,36 @@ fn main() {
         cr.len(),
         || (Vec::new(), Vec::new(), DateCache::new(), Bins::<Click>::new(P2, ck_cap)),
         |(buf, pos, dc, parts), i| {
+            // clicks wait in a small ring so the link-table prefetch can land
+            const RING: usize = 16;
+            let mut ring = [Click { person: 0, cid: 0, ts: 0, camp: 0 }; RING];
+            let mut rn = 0usize;
+            let out = |c: Click, parts: &mut Bins<Click>| {
+                let person = person_of(c.person);
+                parts.push(part2(person), Click { person, ..c });
+            };
             with_rows::<4>(&csrc, &cr[i], buf, pos, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                let uk = key(f[1]);
-                linkmap.prefetch(uk);
                 let Some(ts) = parse_ts(f[3], dc) else { return };
                 let rel = ts.wrapping_sub(cs) as u64;
                 if rel >= csz {
                     return;
                 }
                 let Some(camp) = campaigns.get(f[2]) else { return };
-                let person = person_of(uk);
-                parts.push(part2(person), Click { person, cid: key(f[0]), ts: rel as u32, camp });
+                let uk = key(f[1]);
+                linkmap.prefetch(uk);
+                let slot = rn % RING;
+                if rn >= RING {
+                    out(ring[slot], parts);
+                }
+                ring[slot] = Click { person: uk, cid: key(f[0]), ts: rel as u32, camp };
+                rn += 1;
             });
+            for j in rn.saturating_sub(RING)..rn {
+                out(ring[j % RING], parts);
+            }
         },
     );
     lap("clicks parsed");
