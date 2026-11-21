@@ -644,7 +644,7 @@ fn main() {
                     return;
                 }
                 let eid = key(f[0]);
-                let ing_ms = parse_ts(f[3], dc);
+                let ing_ms = time::parse_ingest(f[3], dc);
                 let ingest = match ing_ms {
                     Some(m) => (m.wrapping_sub(ibase) as u64).min(u32::MAX as u64 - 1) as u32,
                     None => u32::MAX,

@@ -119,6 +119,29 @@ fn parse_dt(b: &[u8], c: &mut DateCache) -> Option<i64> {
 }
 
 #[inline(always)]
+/// An `ingest_ts`, which the rules guarantee is valid F1: only the date is
+/// checked (through the cache); anything not 20 bytes long takes the full path.
+#[inline(always)]
+pub fn parse_ingest(b: &[u8], c: &mut DateCache) -> Option<i64> {
+    if b.len() != 20 {
+        return parse_ts(b, c);
+    }
+    let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let w1 = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    let i = ((w0.wrapping_mul(0x9E3779B97F4A7C15) ^ (w1 as u64).wrapping_mul(0xC2B2AE3D27D4EB4F)) >> 58) as usize;
+    let day = if c.k0[i] == w0 && c.k1[i] == w1 && c.v[i] != i64::MIN {
+        c.v[i]
+    } else {
+        return parse_ts(b, c);
+    };
+    let x = u64::from_le_bytes(b[11..19].try_into().unwrap()).wrapping_sub(0x3030_3030_3030_3030);
+    let v = x.wrapping_mul(10).wrapping_add(x >> 8); // lane 0 = HH, lane 3 = MM, lane 6 = SS
+    let h = (v & 0xFF) as i64;
+    let mi = ((v >> 24) & 0xFF) as i64;
+    let s = ((v >> 48) & 0xFF) as i64;
+    Some(day + (h * 3600 + mi * 60 + s) * 1000)
+}
+
 pub fn parse_ts(b: &[u8], c: &mut DateCache) -> Option<i64> {
     let n = b.len();
     if n == 20 {
