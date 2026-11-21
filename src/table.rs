@@ -17,6 +17,17 @@ impl Map64 {
         let cap = (n * 2).next_power_of_two().max(16);
         Map64 { slots: vec![[EMPTY, 0]; cap], mask: cap - 1 }
     }
+    /// Empties the map and sizes it for n keys at a load of at most ~0.65,
+    /// reusing the allocation.
+    pub fn reset(&mut self, n: usize) {
+        let cap = (n + n / 2 + 16).next_power_of_two();
+        if self.slots.len() < cap {
+            self.slots = vec![[EMPTY, 0]; cap];
+        } else {
+            self.slots[..cap].fill([EMPTY, 0]);
+        }
+        self.mask = cap - 1;
+    }
     /// The slot holding k, or the empty slot where k would go.
     #[inline(always)]
     pub fn slot(&self, k: u64) -> usize {

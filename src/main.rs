@@ -65,7 +65,7 @@ where
 // ---------------------------------------------------------------- csv
 /// Splits one line into exactly N fields per the rules' dialect; false if malformed.
 #[inline(always)]
-fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
+pub(crate) fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> bool {
     if line.is_empty() {
         return false;
     }
@@ -204,7 +204,8 @@ fn with_rows<const N: usize>(
         let end_rel = r.b - from;
         if d[end_rel - 1..].contains(&b'\n') {
             let p = if r.a > s.data_start { memchr_nl(d, 0) + 1 } else { 0 };
-            csv::rows::<N>(d, p, end_rel, pos, f);
+            let _ = pos;
+            csv::rows_fast::<N>(d, p, end_rel, f);
             return;
         }
     }
@@ -229,7 +230,8 @@ fn with_rows<const N: usize>(
             continue;
         }
         let p = if r.a > s.data_start { memchr_nl(d, 0) + 1 } else { 0 };
-        csv::rows::<N>(d, p, end_rel.min(d.len()), pos, f);
+        let _ = pos;
+        csv::rows_fast::<N>(d, p, end_rel.min(d.len()), f);
         return;
     }
 }
@@ -599,7 +601,6 @@ fn main() {
         std::process::exit(0);
     }
     let wsz = (we - ws) as u64;
-    let nolook = std::env::var_os("NOLOOK").is_some();
     let ev_bytes: usize = esrc.iter().map(|s| s.len - s.data_start).sum();
     let ev_est = ev_bytes / 70 + 1024; // rows, about 75 bytes each
     let ev_cap = ev_est * 11 / 10 / (nt * P1) + 64;
@@ -610,14 +611,7 @@ fn main() {
         |st, i| {
             let parts = &mut st.parts;
             let dc = &mut st.dc;
-            // rows wait in a small ring so the link-table prefetch has time to land
-            const RING: usize = 32;
-            let mut ring = [RawEv { eid: 0, person: 0, ts: 0, ingest: 0, price: 0, cat: 0, kind: 255 }; RING];
-            let mut rh = 0usize;
-            let mut rc = 0usize;
-            let emit = |mut o: RawEv, parts: &mut Bins<RawEv>| {
-                if o.kind != 255 {
-                }
+            let emit = |o: RawEv, parts: &mut Bins<RawEv>| {
                 parts.push(part1(o.eid), o);
             };
             with_rows::<7>(&esrc, &er[i], &mut st.buf, &mut st.pos, |f| {
@@ -660,21 +654,13 @@ fn main() {
                     }
                     r.person = uk; // resolved when it leaves the ring
                     r.ts = rel as u32;
-                    r.cat = products.get(f[5]);
+                    if kind == 2 {
+                        r.cat = products.get(f[5]);
+                    }
                     r.kind = kind;
                 }
-                if rc == RING {
-                    emit(ring[rh], parts);
-                    ring[rh] = r;
-                    rh = (rh + 1) % RING;
-                } else {
-                    ring[(rh + rc) % RING] = r;
-                    rc += 1;
-                }
+                emit(r, parts);
             });
-            for j in 0..rc {
-                emit(ring[(rh + j) % RING], parts);
-            }
         },
     );
         (parsed, h.join().unwrap(), ev_est)
@@ -683,14 +669,15 @@ fn main() {
     lap("links + events parsed");
 
     // ---- dedup per event_id partition, then repartition by person
-    let deduped: Vec<Bins<Ev>> = par(
+    let deduped: Vec<(Bins<Ev>, Vec<Ev>, Map64)> = par(
         nt,
         P1,
-        || Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64),
-        |out, p| {
+        || (Bins::<Ev>::new(P2, ev_est / (nt * P2) + 64), Vec::<Ev>::new(), Map64::new(16)),
+        |(out, surv, t), p| {
             let total: usize = parsed.iter().map(|s| s.parts.len(p)).sum();
-            let mut surv: Vec<Ev> = Vec::with_capacity(total);
-            let mut t = Map64::new(total + 16);
+            surv.clear();
+            surv.reserve(total);
+            t.reset(total);
             // value = ingest << 32 | row number; keep the copy with the smallest ingest
             let mut idx = 0u64;
             for s in parsed.iter() {
@@ -717,7 +704,7 @@ fn main() {
                 }
             }
             // user -> person, with the link-table loads prefetched ahead
-            const AHEAD: usize = 16;
+            const AHEAD: usize = 48;
             for j in 0..surv.len().min(AHEAD) {
                 linkmap.prefetch(surv[j].person);
             }
@@ -731,6 +718,7 @@ fn main() {
             }
         },
     );
+    let deduped: Vec<Bins<Ev>> = deduped.into_iter().map(|x| x.0).collect();
     std::mem::forget(parsed);
     lap("events deduped");
 
@@ -785,6 +773,7 @@ fn main() {
         clid: Vec<u32>,
         eoff: Vec<u32>,
         coff: Vec<u32>,
+        lm: Map64,
     }
     let order: Vec<usize> = {
         let mut o: Vec<(usize, usize)> =
@@ -795,7 +784,7 @@ fn main() {
     let sres: Vec<SState> = par(
         nt,
         P2,
-        || SState { camp: vec![[0i64; 4]; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new() },
+        || SState { camp: vec![[0i64; 4]; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new(), lm: Map64::new(16) },
         |st, oi| {
             let b = order[oi];
             let evs = &mut st.evs;
@@ -813,7 +802,8 @@ fn main() {
                 cks.extend_from_slice(y);
             }
             // group by person with a counting sort, then order each person's rows by time
-            let mut lm = Map64::new(evs.len() / 4 + 16);
+            let lm = &mut st.lm;
+            lm.reset(evs.len() + 16);
             let elid = &mut st.elid;
             elid.clear();
             let mut nl = 0u64;

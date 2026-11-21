@@ -202,3 +202,91 @@ pub fn rows<const N: usize>(d: &[u8], start: usize, stop: usize, _pos: &mut Vec<
         }
     }
 }
+
+#[inline(always)]
+fn masks128(p: *const u8) -> (u128, u128, u128) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v0 = _mm512_loadu_si512(p as *const _);
+        let v1 = _mm512_loadu_si512(p.add(64) as *const _);
+        let nl = _mm512_set1_epi8(b'\n' as i8);
+        let cm = _mm512_set1_epi8(b',' as i8);
+        let qt = _mm512_set1_epi8(b'"' as i8);
+        let n = (_mm512_cmpeq_epi8_mask(v0, nl) as u128) | ((_mm512_cmpeq_epi8_mask(v1, nl) as u128) << 64);
+        let c = (_mm512_cmpeq_epi8_mask(v0, cm) as u128) | ((_mm512_cmpeq_epi8_mask(v1, cm) as u128) << 64);
+        let q = (_mm512_cmpeq_epi8_mask(v0, qt) as u128) | ((_mm512_cmpeq_epi8_mask(v1, qt) as u128) << 64);
+        (n, c, q)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+    {
+        let (mut n, mut c, mut q) = (0u128, 0u128, 0u128);
+        for j in 0..128 {
+            let b = unsafe { *p.add(j) };
+            n |= ((b == b'\n') as u128) << j;
+            c |= ((b == b',') as u128) << j;
+            q |= ((b == b'"') as u128) << j;
+        }
+        (n, c, q)
+    }
+}
+
+/// Like `rows`, but cuts each line with two 64-byte compares and no
+/// data-dependent branches. Lines over 127 bytes, and a last line without a
+/// newline, go through the scalar splitter. Needs 128 readable bytes past d.len().
+const PF: usize = 4096;
+
+#[inline(always)]
+pub fn rows_fast<const N: usize>(d: &[u8], start: usize, stop: usize, mut f: impl FnMut(&[&[u8]; N])) {
+    let base = d.as_ptr();
+    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut ls = start;
+    while ls < stop {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(base.add(ls + PF) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        let (n, c, q) = masks128(unsafe { base.add(ls) });
+        if n == 0 || ls + (n.trailing_zeros() as usize) >= d.len() {
+            // long line, or the data ends without a newline
+            let e = match d[ls..].iter().position(|&x| x == b'\n') {
+                Some(p) => ls + p,
+                None => d.len(),
+            };
+            if crate::split(&d[ls..e], &mut fields) {
+                f(&fields);
+            }
+            ls = e + 1;
+            continue;
+        }
+        let l = n.trailing_zeros() as usize;
+        let lm = (1u128 << l) - 1;
+        let mut c = c & lm;
+        let q = q & lm;
+        let next = ls + l + 1;
+        if c.count_ones() as usize != N - 1 {
+            ls = next;
+            continue;
+        }
+        // a quote may only open a field (after a separator) or close one (before a separator)
+        let seps = c | (1u128 << l);
+        let starts = (c << 1) | 1;
+        let ends1 = seps >> 1;
+        let mut ok = q & !(starts | ends1) == 0;
+        let mut s = 0usize;
+        for i in 0..N {
+            let e = if i + 1 < N { c.trailing_zeros() as usize } else { l };
+            c &= c.wrapping_sub(1);
+            let qa = (e > s && unsafe { *base.add(ls + s) } == b'"') as usize;
+            let qb = (e >= s + 2 && unsafe { *base.add(ls + e - 1) } == b'"') as usize;
+            ok &= qa == qb;
+            let (a, b) = (s + qa, (e - qb).max(s + qa));
+            fields[i] = unsafe { std::slice::from_raw_parts(base.add(ls + a), b - a) };
+            s = e + 1;
+        }
+        if ok {
+            f(&fields);
+        }
+        ls = next;
+    }
+}
