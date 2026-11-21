@@ -661,8 +661,13 @@ fn main() {
                 }
                 emit(r, parts);
             });
+            table::fence();
         },
     );
+        let mut parsed = parsed;
+        for st in parsed.iter_mut() {
+            st.parts.finish();
+        }
         (parsed, h.join().unwrap(), ev_est)
     });
     let person_of = |u: Key| -> Key { linkmap.map(u) };
@@ -723,9 +728,16 @@ fn main() {
                 e.person = person_of(e.person);
                 out.push(part2(e.person), e);
             }
+            table::fence();
         },
     );
-    let deduped: Vec<Bins<Ev>> = deduped.into_iter().map(|x| x.0).collect();
+    let deduped: Vec<Bins<Ev>> = deduped
+        .into_iter()
+        .map(|mut x| {
+            x.0.finish();
+            x.0
+        })
+        .collect();
     std::mem::forget(parsed);
     lap("events deduped");
 

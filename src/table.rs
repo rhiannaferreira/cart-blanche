@@ -165,44 +165,99 @@ impl LinkMap {
     }
 }
 
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line([u8; 64]);
+
 /// Fixed-capacity bins carved from one huge-page region, for scattering
 /// records into partitions without reallocation. A bin that fills up spills
-/// into an ordinary Vec.
+/// into an ordinary Vec. Records whose size divides 64 are gathered into a
+/// cache line per bin and written out whole with streaming stores; call
+/// `finish` before reading.
 pub struct Bins<T: Copy + 'static> {
     base: *mut T,
     cap: usize,
     lens: Vec<usize>,
     spill: Vec<Vec<T>>,
+    wc: Vec<Line>,
 }
 
 unsafe impl<T: Copy + Send + 'static> Send for Bins<T> {}
 unsafe impl<T: Copy + Sync + 'static> Sync for Bins<T> {}
 
 impl<T: Copy + 'static> Bins<T> {
+    const PER: usize = if 64 % std::mem::size_of::<T>() == 0 { 64 / std::mem::size_of::<T>() } else { 0 };
     pub fn new(nbins: usize, cap: usize) -> Self {
-        let cap = cap.max(4);
+        let mut cap = cap.max(4);
+        if Self::PER > 0 {
+            cap = cap.next_multiple_of(Self::PER);
+        }
         let mem = alloc_huge::<T>(nbins * cap);
-        Bins { base: mem.as_mut_ptr(), cap, lens: vec![0; nbins], spill: (0..nbins).map(|_| Vec::new()).collect() }
+        let wc = if Self::PER > 0 { vec![Line([0; 64]); nbins] } else { Vec::new() };
+        Bins { base: mem.as_mut_ptr(), cap, lens: vec![0; nbins], spill: (0..nbins).map(|_| Vec::new()).collect(), wc }
     }
     #[inline(always)]
     pub fn push(&mut self, b: usize, x: T) {
         let l = unsafe { *self.lens.get_unchecked(b) };
         if l < self.cap {
             unsafe {
-                self.base.add(b * self.cap + l).write(x);
                 *self.lens.get_unchecked_mut(b) = l + 1;
+                if Self::PER == 0 {
+                    self.base.add(b * self.cap + l).write(x);
+                    return;
+                }
+                let k = l % Self::PER;
+                let line = self.wc.get_unchecked_mut(b) as *mut Line as *mut T;
+                line.add(k).write(x);
+                if k == Self::PER - 1 {
+                    let dst = self.base.add(b * self.cap + l + 1 - Self::PER);
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+                    {
+                        use std::arch::x86_64::*;
+                        let v = _mm512_load_si512(line as *const _);
+                        _mm512_stream_si512(dst as *mut _, v);
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+                    std::ptr::copy_nonoverlapping(line, dst, Self::PER);
+                }
             }
         } else {
             self.spill[b].push(x);
         }
     }
+    /// Writes out partly filled lines. Call on the reading side, after the
+    /// writing thread has finished (and fenced).
+    pub fn finish(&mut self) {
+        if Self::PER == 0 {
+            return;
+        }
+        for b in 0..self.lens.len() {
+            let l = self.lens[b].min(self.cap);
+            let k = l % Self::PER;
+            if k > 0 {
+                unsafe {
+                    let line = &self.wc[b] as *const Line as *const T;
+                    std::ptr::copy_nonoverlapping(line, self.base.add(b * self.cap + l - k), k);
+                }
+            }
+        }
+    }
     #[inline(always)]
     pub fn bin(&self, b: usize) -> (&[T], &[T]) {
-        let s = unsafe { std::slice::from_raw_parts(self.base.add(b * self.cap), self.lens[b]) };
+        let s = unsafe { std::slice::from_raw_parts(self.base.add(b * self.cap), self.lens[b].min(self.cap)) };
         (s, &self.spill[b])
     }
     pub fn len(&self, b: usize) -> usize {
-        self.lens[b] + self.spill[b].len()
+        self.lens[b].min(self.cap) + self.spill[b].len()
+    }
+}
+
+/// Orders this thread's streaming stores before what follows.
+#[inline(always)]
+pub fn fence() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_sfence()
     }
 }
 
