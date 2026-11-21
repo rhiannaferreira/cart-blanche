@@ -264,11 +264,13 @@ pub fn write_all(
     std::fs::create_dir_all(&ud).expect("mkdir");
     std::fs::create_dir_all(&cd).expect("mkdir");
 
-    let nfiles = nt.max(1).min(users.len().max(1));
+    let nfiles = (3 * nt).max(1).min(users.len().max(1));
     let per = users.len().div_ceil(nfiles).max(1);
     let groups: Vec<&[Vec<UserRow>]> = users.chunks(per).collect();
     let ng = groups.len();
     crate::par(nt, ng + 1, || (), |_, gi| {
+        // campaign_daily first, then the user files
+        let gi = if gi == 0 { ng } else { gi - 1 };
         if gi == ng {
             // campaign_daily
             let mut c = [
