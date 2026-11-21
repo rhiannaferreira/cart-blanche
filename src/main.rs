@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AO};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AO};
 
 mod csv;
 mod keys;
@@ -76,6 +76,20 @@ where
         }
         r.into_iter().map(|x| x.0).collect()
     })
+}
+
+static CLICK_NS: AtomicU64 = AtomicU64::new(0);
+static DEDUP_NS: AtomicU64 = AtomicU64::new(0);
+struct TaskTimer(&'static AtomicU64, std::time::Instant);
+impl TaskTimer {
+    fn new(a: &'static AtomicU64) -> Self {
+        TaskTimer(a, std::time::Instant::now())
+    }
+}
+impl Drop for TaskTimer {
+    fn drop(&mut self) {
+        self.0.fetch_add(self.1.elapsed().as_nanos() as u64, AO::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------- csv
@@ -743,6 +757,7 @@ fn main() {
             parts: Bins::<Click>::new(P2, ck_cap),
         },
         |st, task| {
+            let _tt = TaskTimer::new(if task < ncr { &CLICK_NS } else { &DEDUP_NS });
             if task < ncr {
                 let i = task;
                 let (buf, pos, dc, parts) = (&mut st.buf, &mut st.pos, &mut st.dc, &mut st.parts);
@@ -847,6 +862,9 @@ fn main() {
     }
     std::mem::forget(parsed);
     lap("clicks parsed, events deduped");
+    if timing {
+        eprintln!("  cpu: clicks {:.3}s dedup {:.3}s", CLICK_NS.load(AO::Relaxed) as f64 / 1e9, DEDUP_NS.load(AO::Relaxed) as f64 / 1e9);
+    }
 
     // ---- sessionize + attribute per person partition
     let day0 = ws.div_euclid(DAY_MS);
