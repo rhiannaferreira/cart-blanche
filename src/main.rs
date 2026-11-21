@@ -845,6 +845,7 @@ fn main() {
 
     struct SState {
         camp: Vec<[i64; 4]>,
+        asst: Vec<u32>,
         users: Vec<Vec<UserRow>>,
         evs: Vec<Ev>,
         cks: Vec<Click>,
@@ -862,10 +863,11 @@ fn main() {
         o.sort_unstable_by(|a, b| b.cmp(a));
         o.into_iter().map(|x| x.1).collect()
     };
+    let noassist = std::env::var_os("NOASSIST").is_some();
     let sres: Vec<SState> = par(
         nt,
         P2,
-        || SState { camp: vec![[0i64; 4]; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new(), lm: Map64::new(16) },
+        || SState { camp: vec![[0i64; 4]; ncamp * ndays], asst: vec![0u32; ncamp * ndays], users: vec![], evs: Vec::new(), cks: Vec::new(), ev2: Vec::new(), ck2: Vec::new(), elid: Vec::new(), clid: Vec::new(), eoff: Vec::new(), coff: Vec::new(), lm: Map64::new(16) },
         |st, oi| {
             let b = order[oi];
             let mut parts: Vec<&[Ev]> = Vec::with_capacity(2 * deduped.len());
@@ -974,12 +976,16 @@ fn main() {
             let evs = &*ev2;
             let cks = &*ck2;
             let camp_acc = &mut st.camp;
+            let asst = &mut st.asst;
             let mut users: Vec<UserRow> = vec![];
             let mut catrev = vec![0i64; ncat];
             let mut touched: Vec<u16> = vec![];
             let mut s_start: Vec<i64> = vec![]; // click-relative
             let mut s_day: Vec<u32> = vec![];
             let mut pcl: Vec<(u16, u32)> = vec![];
+            let mut day_first: Vec<u32> = vec![];
+            let mut mark: Vec<u32> = vec![0; ncamp];
+            let mut sid = 0u32;
 
             let flush = |row: &UserRow, catrev: &mut Vec<i64>, touched: &mut Vec<u16>, users: &mut Vec<UserRow>| {
                 let mut top = -1i32;
@@ -1004,6 +1010,8 @@ fn main() {
                 s_day.clear();
                 let mut row = UserRow { person, day: -1, sessions: 0, events: 0, revenue: 0, top: -1 };
                 let mut k = 0usize;
+                let mut kl = 0usize;
+                let small_pc = pc.len() <= 48;
                 let mut i = ei;
                 while i < ej {
                     let start = evs[i].ts;
@@ -1045,6 +1053,20 @@ fn main() {
                         k += 1;
                     }
                     let camp = if k > 0 && sc - pc[k - 1].ts as i64 <= WEEK { pc[k - 1].camp } else { organic };
+                    if small_pc {
+                        // assists: campaigns with a click in [start - 7 days, start], each once
+                        while kl < k && (pc[kl].ts as i64) < sc - WEEK {
+                            kl += 1;
+                        }
+                        sid = sid.wrapping_add(1);
+                        for c in &pc[kl..k] {
+                            let m = unsafe { mark.get_unchecked_mut(c.camp as usize) };
+                            if *m != sid {
+                                *m = sid;
+                                asst[c.camp as usize * ndays + dayi as usize] += 1;
+                            }
+                        }
+                    }
                     let a = &mut camp_acc[camp as usize * ndays + dayi as usize];
                     a[0] += 1;
                     a[1] += purch as i64;
@@ -1055,7 +1077,16 @@ fn main() {
                 }
                 flush(&row, &mut catrev, &mut touched, &mut users);
 
-                if !pc.is_empty() {
+                if !pc.is_empty() && !small_pc && !noassist {
+                    // day_first[d] = index of the first session on day d or later
+                    day_first.clear();
+                    let mut si = 0usize;
+                    for d in 0..=ndays {
+                        while si < s_day.len() && (s_day[si] as usize) < d {
+                            si += 1;
+                        }
+                        day_first.push(si as u32);
+                    }
                     pcl.clear();
                     pcl.extend(pc.iter().map(|c| (c.camp, c.ts)));
                     pcl.sort_unstable();
@@ -1069,13 +1100,15 @@ fn main() {
                             e = e.max(pcl[q].1 as i64 + WEEK);
                             q += 1;
                         }
-                        let mut lo = s_start.partition_point(|&s| s < a);
+                        let lo = s_start.partition_point(|&s| s < a);
                         let hi = s_start.partition_point(|&s| s <= e);
-                        while lo < hi {
-                            let d = s_day[lo];
-                            let nx = lo + s_day[lo..hi].partition_point(|&x| x <= d);
-                            camp_acc[camp as usize * ndays + d as usize][3] += (nx - lo) as i64;
-                            lo = nx;
+                        if lo < hi {
+                            let (d0, d1) = (s_day[lo] as usize, s_day[hi - 1] as usize);
+                            let row = &mut asst[camp as usize * ndays..camp as usize * ndays + ndays];
+                            for d in d0..=d1 {
+                                let n = (day_first[d + 1] as usize).min(hi) - (day_first[d] as usize).max(lo);
+                                row[d] += n as u32;
+                            }
                         }
                     }
                 }
@@ -1090,6 +1123,9 @@ fn main() {
     let mut camp_acc = vec![[0i64; 4]; ncamp * ndays];
     let mut users: Vec<Vec<UserRow>> = Vec::with_capacity(P2);
     for s in sres {
+        for (x, y) in camp_acc.iter_mut().zip(s.asst.iter()) {
+            x[3] += *y as i64;
+        }
         for (x, y) in camp_acc.iter_mut().zip(s.camp.iter()) {
             for t in 0..4 {
                 x[t] += y[t];
