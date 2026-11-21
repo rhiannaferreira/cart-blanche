@@ -283,8 +283,8 @@ struct Click {
     camp: u16,
 }
 
-const P1: usize = 1024;
-const P2: usize = 512;
+const P1: usize = 4096;
+const P2: usize = 2048;
 
 #[inline(always)]
 fn mix(x: u64) -> u64 {

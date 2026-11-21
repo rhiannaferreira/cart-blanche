@@ -13,6 +13,18 @@ fn d2(b: &[u8], i: usize) -> Option<u32> {
     }
 }
 
+/// Eight ASCII digits, first in the lowest byte, as a number.
+#[inline(always)]
+fn digits8(w: u64) -> Option<u64> {
+    let x = w.wrapping_sub(0x3030_3030_3030_3030);
+    if (x | x.wrapping_add(0x7676_7676_7676_7676)) & 0x8080_8080_8080_8080 != 0 {
+        return None;
+    }
+    let x = (x.wrapping_mul(10) + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100) + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
+    Some((x.wrapping_mul(10000) + (x >> 32)) & 0xFFFF_FFFF)
+}
+
 #[inline(always)]
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -80,12 +92,26 @@ fn parse_dt(b: &[u8], c: &mut DateCache) -> Option<i64> {
         c.v[i] = d;
         d
     };
-    if b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b[10] != b'T' {
         return None;
     }
-    let h = d2(b, 11)?;
-    let mi = d2(b, 14)?;
-    let s = d2(b, 17)?;
+    // "HH:MM:SS" in one word: ':' at lanes 2 and 5, digits elsewhere
+    let w = u64::from_le_bytes(b[11..19].try_into().unwrap());
+    const COLONS: u64 = 0x0000_3A00_003A_0000;
+    const CMASK: u64 = 0x0000_FF00_00FF_0000;
+    if w & CMASK != COLONS {
+        return None;
+    }
+    let x = (w & !CMASK).wrapping_sub(0x3030_0030_3000_3030 & !CMASK);
+    let x = x & !CMASK;
+    // every digit lane must now be 0..=9 with no borrow
+    if (x | x.wrapping_add(0x7676_0076_7600_7676 & !CMASK)) & (0x8080_0080_8000_8080) != 0 {
+        return None;
+    }
+    let lane = |i: u32| ((x >> (8 * i)) & 0xFF) as u32;
+    let h = lane(0) * 10 + lane(1);
+    let mi = lane(3) * 10 + lane(4);
+    let s = lane(6) * 10 + lane(7);
     if h > 23 || mi > 59 || s > 59 {
         return None;
     }
@@ -113,6 +139,15 @@ pub fn parse_ts(b: &[u8], c: &mut DateCache) -> Option<i64> {
     }
     if n == 0 {
         return None;
+    }
+    if (9..=16).contains(&n) {
+        let k = n - 8;
+        let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let w0 = if k == 8 { w0 } else { ((w0 & ((1u64 << (8 * k)) - 1)) << (8 * (8 - k))) | (0x3030_3030_3030_3030u64 >> (8 * k)) };
+        let w1 = u64::from_le_bytes(b[n - 8..n].try_into().unwrap());
+        let hi = digits8(w0)?;
+        let lo = digits8(w1)?;
+        return Some((hi * 100_000_000 + lo) as i64);
     }
     let mut v: u64 = 0;
     for &c in b {
